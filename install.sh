@@ -22,8 +22,11 @@ LOG_DIR="/var/log/${APP_NAME}"
 CONF_FILE="${CONF_DIR}/config.json"
 SERVICE_FILE="/etc/systemd/system/${APP_NAME}.service"
 BIN_FILE="${APP_DIR}/${APP_NAME}"
-REPO_URL="${FAKESNI_REPO_URL:-https://github.com/skyboy610/fakesni}"
+GH_REPO="${FAKESNI_GH_REPO:-skyboy610/FakeSNI}"
+REPO_URL="${FAKESNI_REPO_URL:-https://github.com/${GH_REPO}}"
 REPO_BRANCH="${FAKESNI_REPO_BRANCH:-main}"
+# Optional personal access token (for private-repo release downloads).
+GH_TOKEN="${FAKESNI_GH_TOKEN:-${GH_TOKEN:-}}"
 STATS_URL="http://127.0.0.1:9999"
 MGR_LOG="${LOG_DIR}/manager.log"
 
@@ -230,10 +233,10 @@ install_deps() {
     case "$os" in
         ubuntu|debian)
             apt-get update -y
-            apt-get install -y curl iptables libnetfilter-queue1 qrencode python3 git tar openssl uuid-runtime
+            apt-get install -y curl iptables libnetfilter-queue1 qrencode python3 tar openssl uuid-runtime
             ;;
         centos|rhel|almalinux|rocky|fedora)
-            yum install -y curl iptables libnetfilter_queue qrencode python3 git tar openssl util-linux
+            yum install -y curl iptables libnetfilter_queue qrencode python3 tar openssl util-linux
             ;;
         *)
             warn "Unknown distribution: ${os}. Assuming dependencies are already present."
@@ -242,33 +245,114 @@ install_deps() {
     ok "Dependencies ready."
 }
 
-install_go() {
-    if command -v go >/dev/null 2>&1; then
-        info "Go already installed: $(go version)"
-        return 0
-    fi
-    info "Installing Go 1.23.4..."
-    local arch
+# detect_arch maps the machine's uname to the GitHub release asset suffix.
+detect_arch() {
     case "$(uname -m)" in
-        x86_64)  arch="amd64" ;;
-        aarch64) arch="arm64" ;;
-        *) err "Unsupported architecture: $(uname -m)"; return 1 ;;
+        x86_64)        echo "linux-amd64" ;;
+        aarch64|arm64) echo "linux-arm64" ;;
+        armv7l|armv7)  echo "linux-armv7" ;;
+        *)             echo "" ;;
     esac
-    local ver="1.23.4"
-    local tgz="go${ver}.linux-${arch}.tar.gz"
-    curl -sSL "https://go.dev/dl/${tgz}" -o "/tmp/${tgz}" || { err "Failed to download Go"; return 1; }
-    rm -rf /usr/local/go
-    tar -C /usr/local -xzf "/tmp/${tgz}" || { err "Failed to extract Go"; return 1; }
-    rm -f "/tmp/${tgz}"
-    export PATH="/usr/local/go/bin:${PATH}"
-    if ! grep -q '/usr/local/go/bin' /etc/profile 2>/dev/null; then
-        echo 'export PATH=$PATH:/usr/local/go/bin' >> /etc/profile
-    fi
-    ok "Go installed: $(/usr/local/go/bin/go version)"
 }
 
-build_binary() {
-    info "Cloning source from ${REPO_URL} (branch: ${REPO_BRANCH})..."
+# curl_gh runs curl with optional bearer auth for private-repo downloads.
+curl_gh() {
+    if [[ -n "${GH_TOKEN}" ]]; then
+        curl -fsSL -H "Authorization: Bearer ${GH_TOKEN}" "$@"
+    else
+        curl -fsSL "$@"
+    fi
+}
+
+# latest_tag returns the tag_name of the latest release via the GitHub API.
+latest_tag() {
+    curl_gh "https://api.github.com/repos/${GH_REPO}/releases/latest" 2>/dev/null \
+        | python3 -c 'import json,sys; print(json.load(sys.stdin).get("tag_name",""))' 2>/dev/null
+}
+
+download_binary() {
+    local arch; arch=$(detect_arch)
+    [[ -n "$arch" ]] || { err "Unsupported architecture: $(uname -m)"; return 1; }
+
+    mkdir -p "${APP_DIR}"
+    local asset="${APP_NAME}-${arch}"
+    local tag; tag=$(latest_tag)
+    [[ -z "$tag" ]] && tag="latest"
+
+    local url
+    if [[ "$tag" == "latest" ]]; then
+        url="https://github.com/${GH_REPO}/releases/latest/download/${asset}"
+    else
+        url="https://github.com/${GH_REPO}/releases/download/${tag}/${asset}"
+    fi
+
+    info "Downloading prebuilt binary (${arch}, ${tag})..."
+    local tmp="/tmp/${asset}.$$"
+    if ! curl_gh -o "${tmp}" "${url}"; then
+        err "Failed to download ${url}"
+        if [[ -z "${GH_TOKEN}" ]]; then
+            info "If the repository is private, set FAKESNI_GH_TOKEN to a PAT with repo read access and retry."
+        fi
+        info "If no release exists yet, push a git tag like 'v1.0.0' to trigger the build workflow,"
+        info "or run 'FAKESNI_FROM_SOURCE=1 sudo bash install.sh' to build from source."
+        rm -f "${tmp}"
+        return 1
+    fi
+
+    # Verify checksum when available (optional — release provides checksums.txt).
+    local sums="/tmp/fakesni-checksums.$$"
+    local sums_url
+    if [[ "$tag" == "latest" ]]; then
+        sums_url="https://github.com/${GH_REPO}/releases/latest/download/checksums.txt"
+    else
+        sums_url="https://github.com/${GH_REPO}/releases/download/${tag}/checksums.txt"
+    fi
+    if curl_gh -o "${sums}" "${sums_url}" 2>/dev/null; then
+        local expected; expected=$(awk -v a="${asset}" '$2==a{print $1}' "${sums}")
+        if [[ -n "$expected" ]]; then
+            local got; got=$(sha256sum "${tmp}" | awk '{print $1}')
+            if [[ "${got}" != "${expected}" ]]; then
+                err "Checksum mismatch for ${asset}"
+                rm -f "${tmp}" "${sums}"
+                return 1
+            fi
+            ok "Checksum verified."
+        fi
+        rm -f "${sums}"
+    fi
+
+    install -m 0755 "${tmp}" "${BIN_FILE}"
+    rm -f "${tmp}"
+    ok "Binary installed: ${BIN_FILE}"
+}
+
+# build_from_source is the fallback path when prebuilt binaries aren't available.
+# Enabled by setting FAKESNI_FROM_SOURCE=1 in the environment.
+build_from_source() {
+    info "Building from source (FAKESNI_FROM_SOURCE=1)..."
+    # install git + go toolchain
+    local os; os=$(detect_os)
+    case "$os" in
+        ubuntu|debian) apt-get install -y git ;;
+        centos|rhel|almalinux|rocky|fedora) yum install -y git ;;
+    esac
+    if ! command -v go >/dev/null 2>&1; then
+        local arch
+        case "$(uname -m)" in
+            x86_64)  arch="amd64" ;;
+            aarch64) arch="arm64" ;;
+            *) err "Unsupported arch for source build: $(uname -m)"; return 1 ;;
+        esac
+        local ver="1.23.4"
+        local tgz="go${ver}.linux-${arch}.tar.gz"
+        info "Installing Go ${ver}..."
+        curl -sSL "https://go.dev/dl/${tgz}" -o "/tmp/${tgz}" || { err "Failed to download Go"; return 1; }
+        rm -rf /usr/local/go
+        tar -C /usr/local -xzf "/tmp/${tgz}" || { err "Failed to extract Go"; return 1; }
+        rm -f "/tmp/${tgz}"
+        export PATH="/usr/local/go/bin:${PATH}"
+    fi
+
     mkdir -p "${APP_DIR}"
     local src="/tmp/fakesni-src"
     rm -rf "$src"
@@ -278,7 +362,19 @@ build_binary() {
     [[ -n "$gobin" ]] || { err "Go toolchain not found"; return 1; }
     ( cd "$src" && "$gobin" build -o "${BIN_FILE}" . ) || { err "Go build failed"; return 1; }
     chmod +x "${BIN_FILE}"
-    ok "Binary built: ${BIN_FILE}"
+    ok "Binary built from source: ${BIN_FILE}"
+}
+
+# install_binary picks between prebuilt download and source build.
+install_binary() {
+    if [[ "${FAKESNI_FROM_SOURCE:-0}" == "1" ]]; then
+        build_from_source
+    else
+        download_binary || {
+            warn "Falling back to source build..."
+            build_from_source
+        }
+    fi
 }
 
 write_default_config() {
@@ -344,9 +440,8 @@ EOF
 
 do_install() {
     need_root
-    install_deps || return 1
-    install_go   || return 1
-    build_binary || return 1
+    install_deps    || return 1
+    install_binary  || return 1
     write_default_config
     write_service
     info "Next: set the upstream IP (menu 2), then start the service via Manager → Start."
@@ -738,8 +833,8 @@ restore_conf() {
 update_from_git() {
     need_root
     is_installed || { err "Install first."; return 1; }
-    info "Updating from ${REPO_URL} ..."
-    build_binary || return 1
+    info "Updating binary from latest release..."
+    install_binary || return 1
     systemctl restart "${APP_NAME}" 2>/dev/null || true
     ok "Update complete."
 }
@@ -816,7 +911,7 @@ manager_banner() {
     printf '%s\n' "  ${BOLD}${C5}[5]${RST}  ${C5}View logs${RST}"
     printf '%s\n' "  ${BOLD}${C6}[6]${RST}  ${C6}Backup config${RST}"
     printf '%s\n' "  ${BOLD}${C7}[7]${RST}  ${C7}Restore config${RST}"
-    printf '%s\n' "  ${BOLD}${C8}[8]${RST}  ${C8}Update from git${RST}"
+    printf '%s\n' "  ${BOLD}${C8}[8]${RST}  ${C8}Update to latest release${RST}"
     printf '%s\n' "  ${BOLD}${C9}[9]${RST}  ${C9}Uninstall everything${RST}"
     printf '%s\n' "  ${BOLD}${FG_GRAY}[0]${RST}  ${FG_GRAY}Back to main menu${RST}"
     printf '%s\n' "${C9}──────────────────────────────────────────────────${RST}"
