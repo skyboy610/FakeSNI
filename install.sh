@@ -247,14 +247,14 @@ install_go() {
         info "Go already installed: $(go version)"
         return 0
     fi
-    info "Installing Go 1.22..."
+    info "Installing Go 1.23.4..."
     local arch
     case "$(uname -m)" in
         x86_64)  arch="amd64" ;;
         aarch64) arch="arm64" ;;
         *) err "Unsupported architecture: $(uname -m)"; return 1 ;;
     esac
-    local ver="1.22.5"
+    local ver="1.23.4"
     local tgz="go${ver}.linux-${arch}.tar.gz"
     curl -sSL "https://go.dev/dl/${tgz}" -o "/tmp/${tgz}" || { err "Failed to download Go"; return 1; }
     rm -rf /usr/local/go
@@ -480,7 +480,7 @@ gen_client_config() {
     fi
 
     echo
-    printf '%s\n' "${C4}──── Generate Client Config (all fields auto) ────${RST}"
+    printf '%s\n' "${C4}──── Generate Client Config ────${RST}"
     printf '%s\n' "  ${C1}[1]${RST} ${C1}VLESS + TLS (recommended)${RST}"
     printf '%s\n' "  ${C3}[2]${RST} ${C3}Trojan${RST}"
     printf '%s\n' "  ${C5}[3]${RST} ${C5}Shadowsocks${RST}"
@@ -488,7 +488,17 @@ gen_client_config() {
     proto=${proto:-1}
 
     local sni remark short_ts id meth link outbound_json upstream_note
-    sni=$(pick_sni)
+    local default_sni; default_sni=$(pick_sni)
+    if [[ "$proto" == "1" || "$proto" == "2" ]]; then
+        echo
+        printf '%s\n' "${DIM}Client SNI is what v2rayNG puts in its TLS handshake. For normal${RST}"
+        printf '%s\n' "${DIM}VLESS/Trojan it must match the upstream server's TLS cert.${RST}"
+        printf '%s\n' "${DIM}For Reality or allowInsecure=1 setups, any SNI from the pool works.${RST}"
+        read -r -p "Client SNI [${default_sni}]: " sni
+        sni="${sni:-$default_sni}"
+    else
+        sni="$default_sni"
+    fi
     short_ts=$(date +%s | tail -c 5)
     remark="${APP_NAME}-${short_ts}"
     local remark_enc; remark_enc=$(url_encode "$remark")
